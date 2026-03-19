@@ -55,6 +55,14 @@ assert GITHUB_USER, "GITHUB_USER not set. Add it to your config cell (see README
 assert GITHUB_REPO, "GITHUB_REPO not set. Add it to your config cell (see README)."
 BOOT_BRANCH = str(os.environ.get("OUROBOROS_BOOT_BRANCH", "ouroboros"))
 
+# DB env
+DB_NAME = os.environ.get("DB_NAME", "").strip()
+DB_SCHEMA = os.environ.get("DB_SCHEMA", "").strip()
+DB_HOST = os.environ.get("DB_HOST", "").strip()
+DB_PORT = os.environ.get("DB_PORT", "").strip()
+DB_USER = os.environ.get("DB_USER", "").strip()
+DB_PASS = os.environ.get("DB_PASS", "").strip()
+
 REPO_DIR = pathlib.Path("/content/ouroboros_repo").resolve()
 REMOTE_URL = f"https://{GITHUB_TOKEN}:x-oauth-basic@github.com/{GITHUB_USER}/{GITHUB_REPO}.git"
 
