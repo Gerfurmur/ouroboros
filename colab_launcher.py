@@ -146,6 +146,12 @@ os.environ["OUROBOROS_DIAG_HEARTBEAT_SEC"] = str(DIAG_HEARTBEAT_SEC)
 os.environ["OUROBOROS_DIAG_SLOW_CYCLE_SEC"] = str(DIAG_SLOW_CYCLE_SEC)
 os.environ["TELEGRAM_BOT_TOKEN"] = str(TELEGRAM_BOT_TOKEN)
 
+# Optional: DB secrets for SQL tools (pass-through to worker env)
+for _db_secret in ["DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASS"]:
+    _db_val = get_secret(_db_secret, default="")
+    if _db_val:
+        os.environ[_db_secret] = str(_db_val)
+
 if str(ANTHROPIC_API_KEY or "").strip():
     ensure_claude_code_cli()
 
