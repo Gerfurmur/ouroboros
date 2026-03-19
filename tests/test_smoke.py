@@ -43,6 +43,7 @@ TOOL_MODULES = [
     "ouroboros.tools.control",
     "ouroboros.tools.browser",
     "ouroboros.tools.review",
+    "ouroboros.tools.sql_govsupport",
 ]
 
 SUPERVISOR_MODULES = [
@@ -114,6 +115,8 @@ EXPECTED_TOOLS = [
     "compact_context",
     "list_available_tools",
     "enable_tools",
+    # SQL government support
+    "query_govsupport",
 ]
 
 
