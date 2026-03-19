@@ -29,6 +29,13 @@ _SENSITIVE = re.compile(
     re.IGNORECASE,
 )
 
+# Стоп-слова для поиска — слишком общие
+_STOPWORDS = {
+    "субсидии", "субсидия", "для", "на", "и", "в", "с", "по",
+    "получение", "получения", "предоставление", "предоставления",
+    "мер", "меры", "господдержки", "господдержка",
+}
+
 
 def _check_safety(sql: str) -> Optional[str]:
     """Возвращает сообщение об ошибке или None."""
@@ -46,6 +53,20 @@ def _sanitize_rows(rows: List[Dict]) -> List[Dict]:
     return [{k: "***" if _SENSITIVE.search(str(k)) else v for k, v in r.items()} for r in rows]
 
 
+def _extract_keywords(text: str) -> List[str]:
+    """Извлекает значимые ключевые слова из запроса."""
+    words = re.findall(r"[а-яёА-ЯЁa-zA-Z]{4,}", text.lower())
+    keywords = [w for w in words if w not in _STOPWORDS]
+    # Убираем дубли, сохраняем порядок
+    seen = set()
+    unique = []
+    for w in keywords:
+        if w not in seen:
+            seen.add(w)
+            unique.append(w)
+    return unique[:6]  # не более 6 ключевых слов
+
+
 # ---------------------------------------------------------------------------
 # DB connection
 # ---------------------------------------------------------------------------
@@ -55,11 +76,11 @@ def _get_conn():
         import psycopg2
         import psycopg2.extras  # noqa: F401
     except ImportError:
-        raise RuntimeError("psycopg2 не установлен. Выполни: !pip install psycopg2-binary")
+        raise RuntimeError("psycopg2 не установлен.")
 
     missing = [k for k in ("DB_HOST", "DB_NAME", "DB_USER", "DB_PASS") if not os.environ.get(k)]
     if missing:
-        raise RuntimeError(f"Не заданы секреты Colab: {', '.join(missing)}")
+        raise RuntimeError(f"Не заданы секреты: {', '.join(missing)}")
 
     return psycopg2.connect(
         host=os.environ["DB_HOST"],
@@ -103,25 +124,48 @@ def _run(sql: str, params: tuple = ()) -> Tuple[List[Dict], str]:
 # ---------------------------------------------------------------------------
 
 def _search_measures(question: str, ctx_data: Dict) -> Dict:
-    """Ищет субсидии и отборы по текстовому запросу."""
+    """Ищет субсидии по ключевым словам из запроса."""
     conditions = []
     params: List[Any] = []
     explanations = []
 
-    # Текстовый поиск
-    if question:
+    # Извлекаем ключевые слова
+    keywords = _extract_keywords(question)
+
+    if keywords:
+        # Каждое ключевое слово — отдельное условие (AND логика для первых 2, OR для остальных)
+        kw_conds = []
+        for kw in keywords:
+            kw_conds.append("(sp.title ILIKE %s OR sp.description ILIKE %s)")
+            params += [f"%{kw}%", f"%{kw}%"]
+        # Первые 2 ключевых слова обязательны (AND), остальные — опционально
+        if len(kw_conds) >= 2:
+            mandatory = f"({kw_conds[0]} AND {kw_conds[1]})"
+            optional = " OR ".join(kw_conds[2:]) if kw_conds[2:] else None
+            conditions.append(f"({mandatory}{' OR ' + optional if optional else ''})")
+        else:
+            conditions.append(kw_conds[0])
+        explanations.append(f"ключевые слова: {', '.join(keywords)}")
+    elif question:
+        # Фолбек: полная фраза
         conditions.append("(sp.title ILIKE %s OR sp.description ILIKE %s)")
         params += [f"%{question}%", f"%{question}%"]
-        explanations.append(f"поиск по тексту: «{question}»")
+        explanations.append(f"полная фраза: «{question}»")
 
     # Тип получателя
-    app_type = ctx_data.get("applicant_type", "").lower()
-    if "ип" in app_type or "individual" in app_type or "предприним" in app_type:
+    app_type = (ctx_data.get("applicant_type") or question).lower()
+    if any(w in app_type for w in ("ип", "предприним", "individual")):
         conditions.append("sp.individual_entrepreneur = true")
         explanations.append("тип: ИП")
-    elif "юл" in app_type or "legal" in app_type or "юридич" in app_type:
+    elif any(w in app_type for w in ("юл", "юридич", "legal")):
         conditions.append("sp.legal_entity = true")
         explanations.append("тип: ЮЛ")
+
+    # МСП = ИП или ЮЛ
+    if any(w in (question or "").lower() for w in ("мсп", "малого", "среднего", "предприниматель")):
+        if "sp.individual_entrepreneur = true" not in conditions and "sp.legal_entity = true" not in conditions:
+            conditions.append("(sp.individual_entrepreneur = true OR sp.legal_entity = true)")
+            explanations.append("тип: МСП (ИП или ЮЛ)")
 
     # Регион
     region = ctx_data.get("region", "")
@@ -140,16 +184,15 @@ SELECT
     sp.legal_entity,
     sp.individual_entrepreneur,
     r.name AS region_name,
-    sp.region_code,
     sp.document_number,
     sp.short_num,
     sp.publication_date,
-    (SELECT COUNT(*) FROM selections s WHERE s.subsidy_id = sp.subsidy_id AND NOT s.status_closed) AS open_selections_count
+    (SELECT COUNT(*) FROM selections s WHERE s.subsidy_id = sp.subsidy_id AND NOT s.status_closed) AS open_selections
 FROM subsidies_promote sp
 LEFT JOIN regions r ON r.id = sp.region_code
 {where}
 ORDER BY sp.load_dttm DESC
-LIMIT 30
+LIMIT 20
 """.strip()
 
     rows, err = _run(sql, tuple(params))
@@ -166,9 +209,8 @@ LIMIT 30
             "name": r["name"],
             "summary": r.get("summary", ""),
             "applicant_types": "/".join(types) if types else "не указано",
-            "region": r.get("region_name") or str(r.get("region_code", "")),
-            "open_selections": r.get("open_selections_count", 0),
-            "document_number": r.get("document_number"),
+            "region": r.get("region_name", ""),
+            "open_selections": r.get("open_selections", 0),
             "why_matched": "; ".join(explanations) if explanations else "общий поиск",
         })
 
@@ -194,7 +236,6 @@ def _get_selection(question: str, ctx_data: Dict) -> Dict:
     conditions = []
     params: List[Any] = []
 
-    # Пробуем найти UUID в competition_code или в вопросе
     uuids = _UUID_RE.findall(competition_code) or _UUID_RE.findall(question)
     int_ids = _INT_RE.findall(question) if not uuids else []
 
@@ -206,11 +247,9 @@ def _get_selection(question: str, ctx_data: Dict) -> Dict:
         conditions.append("sel.selection_id = %s")
         params.append(int(int_ids[0]))
     elif competition_code:
-        # Пробуем как текст в title
         conditions.append("(sel.title ILIKE %s OR sp.title ILIKE %s)")
         params += [f"%{competition_code}%", f"%{competition_code}%"]
     else:
-        # Поиск по тексту вопроса среди открытых отборов
         conditions.append("(sel.title ILIKE %s OR sel.list_of_req_doc ILIKE %s)")
         params += [f"%{question}%", f"%{question}%"]
 
@@ -237,7 +276,7 @@ SELECT
     sel.documents,
     sel.npa_llm,
     sp.title AS subsidy_title,
-    sp.description AS subsidy_description,
+    LEFT(sp.description, 300) AS subsidy_description,
     r.name AS region_name
 FROM selections sel
 LEFT JOIN subsidies_promote sp ON sp.subsidy_id = sel.subsidy_id
@@ -249,15 +288,15 @@ LIMIT 5
     rows, err = _run(sql_sel, tuple(params))
     sqls = [sql_sel]
 
-    if not rows and not err:
+    if not rows:
         return {
             "sql_queries": sqls,
             "results": [],
-            "explanations": "Отбор не найден. Попробуй указать точный ID или UUID.",
-            "error": None,
+            "explanations": "Отбор не найден. Уточни ID или UUID.",
+            "error": err or None,
         }
 
-    selection = rows[0] if rows else {}
+    selection = rows[0]
     sel_id = selection.get("selection_id")
 
     # Файлы отбора
@@ -268,7 +307,6 @@ LIMIT 5
         sqls.append(sql_files)
         files = [{"name": r.get("name"), "url": r.get("file_url")} for r in file_rows]
 
-    # Форматируем результат
     result = {
         "selection": {
             "id": sel_id,
@@ -279,8 +317,8 @@ LIMIT 5
             "begin_date": str(selection.get("begin_competition_date", "")),
             "end_date": str(selection.get("end_competition_date", "")),
             "winner_date": str(selection.get("selection_winner_date", "")),
-            "max_amount_per_person": selection.get("max_amount_for_person"),
-            "max_amount_per_year": selection.get("max_amount_for_year"),
+            "max_amount_per_person": str(selection.get("max_amount_for_person", "")),
+            "max_amount_per_year": str(selection.get("max_amount_for_year", "")),
             "cofinancing": selection.get("selection_cofinancing"),
             "contacts": selection.get("contacts"),
             "email": selection.get("email"),
@@ -294,13 +332,13 @@ LIMIT 5
     return {
         "sql_queries": sqls,
         "results": [result],
-        "explanations": f"Режим: детали отбора selection_id={sel_id}. Найдено файлов: {len(files)}.",
+        "explanations": f"Режим: детали отбора selection_id={sel_id}. Файлов: {len(files)}.",
         "error": err or None,
     }
 
 
 # ---------------------------------------------------------------------------
-# Main tool function
+# Main entry point
 # ---------------------------------------------------------------------------
 
 def _query_govsupport(
@@ -314,8 +352,8 @@ def _query_govsupport(
 
     Режимы:
     1. search_measures — поиск субсидий по тексту/региону/типу получателя
-    2. get_selection — детали отбора + перечень документов
-    3. raw_sql — прямой SELECT (только при явном параметре sql=)
+    2. get_selection — детали отбора + перечень документов (при наличии competition_code или UUID)
+    3. raw_sql — прямой SELECT (при явном параметре sql=)
     """
     ctx_data: Dict = context or {}
 
@@ -324,7 +362,6 @@ def _query_govsupport(
         err = _check_safety(sql)
         if err:
             return {"sql_queries": [sql], "results": [], "explanations": "Raw SQL", "error": err}
-        # Добавляем LIMIT если нет
         if "limit" not in sql.lower():
             sql = sql.rstrip("; \n") + " LIMIT 100"
         rows, run_err = _run(sql)
@@ -335,17 +372,17 @@ def _query_govsupport(
             "error": run_err or None,
         }
 
-    # Режим 2: Получить детали отбора
+    # Режим 2: Детали отбора
     has_code = bool(ctx_data.get("competition_code"))
     has_uuid = bool(_UUID_RE.search(question))
-    has_sel_id = bool(_INT_RE.search(question)) and any(
-        w in question.lower() for w in ("отбор", "selection", "selection_id", "заявк", "документ")
+    has_sel_keywords = bool(_INT_RE.search(question)) and any(
+        w in question.lower() for w in ("отбор", "selection_id", "заявк", "документ", "selection")
     )
 
-    if has_code or has_uuid or has_sel_id:
+    if has_code or has_uuid or has_sel_keywords:
         return _get_selection(question, ctx_data)
 
-    # Режим 1: Поиск мер/субсидий
+    # Режим 1: Поиск субсидий
     return _search_measures(question, ctx_data)
 
 
@@ -355,29 +392,33 @@ def _query_govsupport(
 
 def get_tools() -> List[ToolEntry]:
     return [
-        ToolEntry(
-            name="query_govsupport",
-            description=(
-                "Запрос к БД мер господдержки. "
-                "Режим 1 (поиск): передай question с описанием нужной субсидии, "
-                "context={region, applicant_type} для фильтрации. "
-                "Режим 2 (детали отбора): передай context={competition_code: UUID/ID} или UUID в question. "
-                "Режим 3 (raw SQL): передай sql=SELECT... "
+        ToolEntry("query_govsupport", {
+            "name": "query_govsupport",
+            "description": (
+                "Запрос к БД мер господдержки РФ (субсидии, отборы, документы). "
+                "Режим 1 — поиск: question='субсидии МСП на сертификацию', "
+                "context={region: 'Ленинградская', applicant_type: 'ИП'}. "
+                "Режим 2 — детали отбора: context={competition_code: 'UUID'} или UUID/ID в question. "
+                "Режим 3 — raw: sql='SELECT ...'. "
                 "Только SELECT. БД read-only."
             ),
-            fn=_query_govsupport,
-            params={
-                "question": {"type": "string", "description": "Текстовый запрос пользователя на русском"},
-                "context": {
-                    "type": "object",
-                    "description": "Фильтры: {competition_code, region, applicant_type}",
-                    "required": False,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "Текстовый запрос на русском (что ищем)",
+                    },
+                    "context": {
+                        "type": "object",
+                        "description": "Фильтры: competition_code (UUID/ID отбора), region, applicant_type (ИП/ЮЛ/МСП)",
+                    },
+                    "sql": {
+                        "type": "string",
+                        "description": "Прямой SELECT-запрос (режим отладки)",
+                    },
                 },
-                "sql": {
-                    "type": "string",
-                    "description": "Прямой SELECT-запрос (только для отладки)",
-                    "required": False,
-                },
+                "required": [],
             },
-        )
+        }, _query_govsupport),
     ]
