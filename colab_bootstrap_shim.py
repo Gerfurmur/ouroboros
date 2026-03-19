@@ -39,7 +39,7 @@ for _name in ("OPENROUTER_API_KEY", "TELEGRAM_BOT_TOKEN", "TOTAL_BUDGET", "GITHU
     export_secret_to_env(_name, required=True)
 
 # Optional secrets (keep empty if missing).
-for _name in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "DB_NAME", "DB_SCHEMA", "DB_HOST", "DB_PORT", "DB_NAME", "DB_PASS"):
+for _name in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "DB_NAME", "DB_SCHEMA", "DB_HOST", "DB_PORT", "DB_USER", "DB_PASS"):
     export_secret_to_env(_name, required=False)
 
 # Colab diagnostics defaults (override in config cell if needed).
@@ -60,7 +60,7 @@ DB_NAME = os.environ.get("DB_NAME", "").strip()
 DB_SCHEMA = os.environ.get("DB_SCHEMA", "").strip()
 DB_HOST = os.environ.get("DB_HOST", "").strip()
 DB_PORT = os.environ.get("DB_PORT", "").strip()
-DB_USER = os.environ.get("DB_USER", "").strip()
+DB_USER = os.environ.get("DB_USER", "postgres").strip()
 DB_PASS = os.environ.get("DB_PASS", "").strip()
 
 REPO_DIR = pathlib.Path("/content/ouroboros_repo").resolve()
