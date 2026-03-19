@@ -167,11 +167,49 @@ def _load_schema() -> Tuple[Dict[str, List[str]], str]:
     return schema, raw
 
 
+
+
+def _load_schema_from_db() -> Dict[str, List[str]]:
+    """Читает реальную схему из information_schema БД."""
+    try:
+        rows, err = _execute_query(
+            "SELECT table_name, column_name FROM information_schema.columns "
+            "WHERE table_schema = 'public' ORDER BY table_name, ordinal_position"
+        )
+        if err or not rows:
+            log.warning("_load_schema_from_db: %s", err or "empty")
+            return {}
+        schema: Dict[str, List[str]] = {}
+        for row in rows:
+            t = str(row.get("table_name", "")).lower()
+            c = str(row.get("column_name", "")).lower()
+            if t and c:
+                schema.setdefault(t, []).append(c)
+        log.info("Schema from DB: %d tables", len(schema))
+        return schema
+    except Exception as e:
+        log.warning("_load_schema_from_db failed: %s", e)
+        return {}
+
 def _get_schema() -> Tuple[Dict[str, List[str]], bool]:
-    """Возвращает схему (с кешированием). Второй элемент — был ли файл найден."""
+    """Возвращает схему (с кешированием).
+    Порядок: файл схемы -> информация_schema БД -> fallback.
+    Второй элемент — был ли файл найден."""
     global _schema_cache, _schema_raw, _schema_loaded
     if not _schema_loaded:
-        _schema_cache, _schema_raw = _load_schema()
+        file_schema, _schema_raw = _load_schema()
+        # Если файл нашли но схема пустая (колонок нет) - читаем из БД
+        has_columns = any(len(v) > 0 for v in file_schema.values())
+        if not has_columns:
+            log.info("Файл схемы не содержит колонок, читаю схему из information_schema BD...")
+            db_schema = _load_schema_from_db()
+            if db_schema:
+                _schema_cache = db_schema
+                log.info("Схема из БД: %d таблиц", len(db_schema))
+            else:
+                _schema_cache = file_schema  # таблицы есть, колонок нет - ну хоть что-то
+        else:
+            _schema_cache = file_schema
         _schema_loaded = True
     schema_from_file = bool(_schema_raw)
     return _schema_cache, schema_from_file
