@@ -29,16 +29,16 @@ _SENSITIVE = re.compile(
     re.IGNORECASE,
 )
 
-# Стоп-слова для поиска — слишком общие
+# Стоп-слова — слишком общие для поиска
 _STOPWORDS = {
-    "субсидии", "субсидия", "для", "на", "и", "в", "с", "по",
-    "получение", "получения", "предоставление", "предоставления",
-    "мер", "меры", "господдержки", "господдержка",
+    "субсидии", "субсидия", "субсидиям", "для", "на", "и", "в", "с", "по", "от",
+    "получение", "получения", "предоставление", "предоставления", "предоставлению",
+    "мер", "меры", "господдержки", "господдержка", "лицам", "лицо",
+    "организаций", "организации", "организация",
 }
 
 
 def _check_safety(sql: str) -> Optional[str]:
-    """Возвращает сообщение об ошибке или None."""
     clean = re.sub(r"/\*.*?\*/", " ", sql, flags=re.DOTALL)
     clean = re.sub(r"--.*", " ", clean).strip()
     if not clean.upper().startswith("SELECT"):
@@ -54,17 +54,16 @@ def _sanitize_rows(rows: List[Dict]) -> List[Dict]:
 
 
 def _extract_keywords(text: str) -> List[str]:
-    """Извлекает значимые ключевые слова из запроса."""
+    """Значимые ключевые слова из запроса."""
     words = re.findall(r"[а-яёА-ЯЁa-zA-Z]{4,}", text.lower())
     keywords = [w for w in words if w not in _STOPWORDS]
-    # Убираем дубли, сохраняем порядок
-    seen = set()
+    seen: set = set()
     unique = []
     for w in keywords:
         if w not in seen:
             seen.add(w)
             unique.append(w)
-    return unique[:6]  # не более 6 ключевых слов
+    return unique[:5]
 
 
 # ---------------------------------------------------------------------------
@@ -94,7 +93,7 @@ def _get_conn():
 
 
 def _run(sql: str, params: tuple = ()) -> Tuple[List[Dict], str]:
-    """Выполняет SELECT. Возвращает (rows, error)."""
+    """SELECT → (rows, error_or_empty)."""
     import psycopg2.extras
 
     err = _check_safety(sql)
@@ -109,7 +108,7 @@ def _run(sql: str, params: tuple = ()) -> Tuple[List[Dict], str]:
             rows = [dict(r) for r in cur.fetchall()]
         return _sanitize_rows(rows), ""
     except Exception as e:
-        log.warning("DB error: %s | SQL: %s", e, sql)
+        log.warning("DB error: %s", e)
         return [], f"Ошибка БД: {e}"
     finally:
         if conn:
@@ -120,82 +119,96 @@ def _run(sql: str, params: tuple = ()) -> Tuple[List[Dict], str]:
 
 
 # ---------------------------------------------------------------------------
-# Mode 1: Search measures/selections
+# Mode 1: Search (selections + subsidies_promote)
 # ---------------------------------------------------------------------------
 
 def _search_measures(question: str, ctx_data: Dict) -> Dict:
-    """Ищет субсидии по ключевым словам из запроса."""
-    conditions = []
-    params: List[Any] = []
+    """Ищет отборы и субсидии по ключевым словам."""
     explanations = []
 
-    # Извлекаем ключевые слова
+    # --- Ключевые слова ---
     keywords = _extract_keywords(question)
+    kw_params: List[Any] = []
+    kw_conditions = []
 
     if keywords:
-        # Каждое ключевое слово — отдельное условие (AND логика для первых 2, OR для остальных)
-        kw_conds = []
         for kw in keywords:
-            kw_conds.append("(sp.title ILIKE %s OR sp.description ILIKE %s)")
-            params += [f"%{kw}%", f"%{kw}%"]
-        # Первые 2 ключевых слова обязательны (AND), остальные — опционально
-        if len(kw_conds) >= 2:
-            mandatory = f"({kw_conds[0]} AND {kw_conds[1]})"
-            optional = " OR ".join(kw_conds[2:]) if kw_conds[2:] else None
-            conditions.append(f"({mandatory}{' OR ' + optional if optional else ''})")
-        else:
-            conditions.append(kw_conds[0])
+            kw_conditions.append(
+                "(sel.title ILIKE %s OR sel.short_name ILIKE %s OR sel.list_of_req_doc ILIKE %s"
+                " OR sp.title ILIKE %s OR sp.description ILIKE %s)"
+            )
+            kw_params += [f"%{kw}%", f"%{kw}%", f"%{kw}%", f"%{kw}%", f"%{kw}%"]
         explanations.append(f"ключевые слова: {', '.join(keywords)}")
-    elif question:
-        # Фолбек: полная фраза
-        conditions.append("(sp.title ILIKE %s OR sp.description ILIKE %s)")
-        params += [f"%{question}%", f"%{question}%"]
-        explanations.append(f"полная фраза: «{question}»")
+    else:
+        kw_conditions.append("1=1")
+
+    # Требуем совпадение хотя бы ОДНОГО ключевого слова (OR)
+    kw_where = " OR ".join(kw_conditions) if kw_conditions else "1=1"
+
+    extra_conditions: List[str] = []
+    extra_params: List[Any] = []
 
     # Тип получателя
-    app_type = (ctx_data.get("applicant_type") or question).lower()
-    if any(w in app_type for w in ("ип", "предприним", "individual")):
-        conditions.append("sp.individual_entrepreneur = true")
-        explanations.append("тип: ИП")
-    elif any(w in app_type for w in ("юл", "юридич", "legal")):
-        conditions.append("sp.legal_entity = true")
-        explanations.append("тип: ЮЛ")
+    q_lower = question.lower()
+    app_type = (ctx_data.get("applicant_type") or "").lower()
+    combined = q_lower + " " + app_type
 
-    # МСП = ИП или ЮЛ
-    if any(w in (question or "").lower() for w in ("мсп", "малого", "среднего", "предприниматель")):
-        if "sp.individual_entrepreneur = true" not in conditions and "sp.legal_entity = true" not in conditions:
-            conditions.append("(sp.individual_entrepreneur = true OR sp.legal_entity = true)")
-            explanations.append("тип: МСП (ИП или ЮЛ)")
+    is_ip = any(w in combined for w in ("ип ", " ип", "предприним", "individual"))
+    is_ul = any(w in combined for w in ("юл ", " юл", "юридич", "legal"))
+    is_msp = any(w in combined for w in ("мсп", "малого", "среднего", "малый", "средний"))
+
+    if is_ip and not is_ul:
+        extra_conditions.append("sp.individual_entrepreneur = true")
+        explanations.append("тип: ИП")
+    elif is_ul and not is_ip:
+        extra_conditions.append("sp.legal_entity = true")
+        explanations.append("тип: ЮЛ")
+    elif is_msp:
+        extra_conditions.append("(sp.individual_entrepreneur = true OR sp.legal_entity = true)")
+        explanations.append("тип: МСП")
 
     # Регион
     region = ctx_data.get("region", "")
     if region:
-        conditions.append("r.name ILIKE %s")
-        params.append(f"%{region}%")
+        extra_conditions.append("r.name ILIKE %s")
+        extra_params.append(f"%{region}%")
         explanations.append(f"регион: {region}")
 
-    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    # Статус отбора
+    if any(w in q_lower for w in ("открыт", "активн", "принима", "идёт", "текущ")):
+        extra_conditions.append("sel.status_closed = false")
+        explanations.append("только открытые")
+
+    extra_where = ""
+    if extra_conditions:
+        extra_where = "AND " + " AND ".join(extra_conditions)
+
+    all_params = tuple(kw_params + extra_params)
 
     sql = f"""
 SELECT
-    sp.subsidy_id AS measure_id,
-    sp.title AS name,
-    LEFT(sp.description, 400) AS summary,
-    sp.legal_entity,
+    sel.selection_id,
+    sel.title,
+    sel.short_name,
+    sel.status_closed,
+    sel.begin_competition_date,
+    sel.end_competition_date,
+    sel.max_amount_for_person,
+    sel.link_selection,
     sp.individual_entrepreneur,
+    sp.legal_entity,
     r.name AS region_name,
-    sp.document_number,
-    sp.short_num,
-    sp.publication_date,
-    (SELECT COUNT(*) FROM selections s WHERE s.subsidy_id = sp.subsidy_id AND NOT s.status_closed) AS open_selections
-FROM subsidies_promote sp
+    sp.title AS subsidy_title
+FROM selections sel
+LEFT JOIN subsidies_promote sp ON sp.subsidy_id = sel.subsidy_id
 LEFT JOIN regions r ON r.id = sp.region_code
-{where}
-ORDER BY sp.load_dttm DESC
+WHERE ({kw_where})
+{extra_where}
+ORDER BY sel.load_dttm DESC
 LIMIT 20
 """.strip()
 
-    rows, err = _run(sql, tuple(params))
+    rows, err = _run(sql, all_params)
 
     results = []
     for r in rows:
@@ -205,16 +218,19 @@ LIMIT 20
         if r.get("legal_entity"):
             types.append("ЮЛ")
         results.append({
-            "measure_id": r["measure_id"],
-            "name": r["name"],
-            "summary": r.get("summary", ""),
+            "measure_id": r["selection_id"],
+            "name": r.get("title") or r.get("short_name", ""),
+            "subsidy_name": r.get("subsidy_title", ""),
+            "status": "закрыт" if r.get("status_closed") else "открыт",
             "applicant_types": "/".join(types) if types else "не указано",
             "region": r.get("region_name", ""),
-            "open_selections": r.get("open_selections", 0),
+            "end_date": str(r.get("end_competition_date", "")),
+            "max_amount": str(r.get("max_amount_for_person", "")),
+            "link": r.get("link_selection", ""),
             "why_matched": "; ".join(explanations) if explanations else "общий поиск",
         })
 
-    explanation = "Режим: поиск субсидий. " + ("; ".join(explanations) or "Без фильтров.")
+    explanation = "Режим: поиск отборов/субсидий. " + ("; ".join(explanations) or "Без фильтров.")
     out: Dict = {"sql_queries": [sql], "results": results, "explanations": explanation}
     if err:
         out["error"] = err
@@ -222,7 +238,7 @@ LIMIT 20
 
 
 # ---------------------------------------------------------------------------
-# Mode 2: Get selection details
+# Mode 2: Selection details
 # ---------------------------------------------------------------------------
 
 _UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE)
@@ -230,19 +246,17 @@ _INT_RE = re.compile(r"\b(\d{4,})\b")
 
 
 def _get_selection(question: str, ctx_data: Dict) -> Dict:
-    """Возвращает детали отбора и список документов."""
     competition_code = ctx_data.get("competition_code", "")
 
-    conditions = []
+    conditions: List[str] = []
     params: List[Any] = []
 
     uuids = _UUID_RE.findall(competition_code) or _UUID_RE.findall(question)
     int_ids = _INT_RE.findall(question) if not uuids else []
 
     if uuids:
-        uuid_val = uuids[0]
         conditions.append("(sel.id::text = %s OR sel.competition_id::text = %s)")
-        params += [uuid_val, uuid_val]
+        params += [uuids[0], uuids[0]]
     elif int_ids:
         conditions.append("sel.selection_id = %s")
         params.append(int(int_ids[0]))
@@ -253,7 +267,7 @@ def _get_selection(question: str, ctx_data: Dict) -> Dict:
         conditions.append("(sel.title ILIKE %s OR sel.list_of_req_doc ILIKE %s)")
         params += [f"%{question}%", f"%{question}%"]
 
-    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    where = "WHERE " + " AND ".join(conditions)
 
     sql_sel = f"""
 SELECT
@@ -264,19 +278,16 @@ SELECT
     sel.begin_competition_date,
     sel.end_competition_date,
     sel.selection_winner_date,
-    sel.selection_agreement_date,
     sel.max_amount_for_person,
     sel.max_amount_for_year,
     sel.selection_cofinancing,
     sel.contacts,
-    sel.post_address,
     sel.email,
     sel.link_selection,
     sel.list_of_req_doc,
     sel.documents,
     sel.npa_llm,
     sp.title AS subsidy_title,
-    LEFT(sp.description, 300) AS subsidy_description,
     r.name AS region_name
 FROM selections sel
 LEFT JOIN subsidies_promote sp ON sp.subsidy_id = sel.subsidy_id
@@ -292,15 +303,14 @@ LIMIT 5
         return {
             "sql_queries": sqls,
             "results": [],
-            "explanations": "Отбор не найден. Уточни ID или UUID.",
+            "explanations": "Отбор не найден.",
             "error": err or None,
         }
 
-    selection = rows[0]
-    sel_id = selection.get("selection_id")
+    sel = rows[0]
+    sel_id = sel.get("selection_id")
 
-    # Файлы отбора
-    files = []
+    files: List[Dict] = []
     if sel_id:
         sql_files = "SELECT name, file_url FROM selections_files WHERE selection_id = %s ORDER BY id"
         file_rows, _ = _run(sql_files, (sel_id,))
@@ -310,35 +320,35 @@ LIMIT 5
     result = {
         "selection": {
             "id": sel_id,
-            "title": selection.get("title"),
-            "subsidy_title": selection.get("subsidy_title"),
-            "status": "закрыт" if selection.get("status_closed") else "открыт",
-            "region": selection.get("region_name"),
-            "begin_date": str(selection.get("begin_competition_date", "")),
-            "end_date": str(selection.get("end_competition_date", "")),
-            "winner_date": str(selection.get("selection_winner_date", "")),
-            "max_amount_per_person": str(selection.get("max_amount_for_person", "")),
-            "max_amount_per_year": str(selection.get("max_amount_for_year", "")),
-            "cofinancing": selection.get("selection_cofinancing"),
-            "contacts": selection.get("contacts"),
-            "email": selection.get("email"),
-            "link": selection.get("link_selection"),
+            "title": sel.get("title"),
+            "subsidy_title": sel.get("subsidy_title"),
+            "status": "закрыт" if sel.get("status_closed") else "открыт",
+            "region": sel.get("region_name"),
+            "begin_date": str(sel.get("begin_competition_date", "")),
+            "end_date": str(sel.get("end_competition_date", "")),
+            "winner_date": str(sel.get("selection_winner_date", "")),
+            "max_amount_per_person": str(sel.get("max_amount_for_person", "")),
+            "max_amount_per_year": str(sel.get("max_amount_for_year", "")),
+            "cofinancing": sel.get("selection_cofinancing"),
+            "contacts": sel.get("contacts"),
+            "email": sel.get("email"),
+            "link": sel.get("link_selection"),
         },
-        "documents_text": selection.get("list_of_req_doc") or selection.get("documents") or "",
-        "npa_summary": selection.get("npa_llm") or "",
+        "documents_text": sel.get("list_of_req_doc") or sel.get("documents") or "",
+        "npa_summary": sel.get("npa_llm") or "",
         "files": files,
     }
 
     return {
         "sql_queries": sqls,
         "results": [result],
-        "explanations": f"Режим: детали отбора selection_id={sel_id}. Файлов: {len(files)}.",
+        "explanations": f"Детали отбора selection_id={sel_id}. Файлов: {len(files)}.",
         "error": err or None,
     }
 
 
 # ---------------------------------------------------------------------------
-# Main entry point
+# Main
 # ---------------------------------------------------------------------------
 
 def _query_govsupport(
@@ -348,16 +358,13 @@ def _query_govsupport(
     sql: Optional[str] = None,
 ) -> Dict:
     """
-    Запрос к БД мер господдержки.
-
-    Режимы:
-    1. search_measures — поиск субсидий по тексту/региону/типу получателя
-    2. get_selection — детали отбора + перечень документов (при наличии competition_code или UUID)
-    3. raw_sql — прямой SELECT (при явном параметре sql=)
+    Запрос к БД мер господдержки РФ.
+    Режим 1 (поиск): question + context={region, applicant_type}.
+    Режим 2 (детали): context={competition_code} или UUID/numeric-ID в question.
+    Режим 3 (raw): sql=SELECT...
     """
     ctx_data: Dict = context or {}
 
-    # Режим 3: Raw SQL
     if sql:
         err = _check_safety(sql)
         if err:
@@ -365,29 +372,22 @@ def _query_govsupport(
         if "limit" not in sql.lower():
             sql = sql.rstrip("; \n") + " LIMIT 100"
         rows, run_err = _run(sql)
-        return {
-            "sql_queries": [sql],
-            "results": rows,
-            "explanations": "Режим: raw SQL.",
-            "error": run_err or None,
-        }
+        return {"sql_queries": [sql], "results": rows, "explanations": "Режим: raw SQL.", "error": run_err or None}
 
-    # Режим 2: Детали отбора
     has_code = bool(ctx_data.get("competition_code"))
     has_uuid = bool(_UUID_RE.search(question))
-    has_sel_keywords = bool(_INT_RE.search(question)) and any(
-        w in question.lower() for w in ("отбор", "selection_id", "заявк", "документ", "selection")
+    has_sel_kw = bool(_INT_RE.search(question)) and any(
+        w in question.lower() for w in ("отбор", "selection", "заявк", "документ")
     )
 
-    if has_code or has_uuid or has_sel_keywords:
+    if has_code or has_uuid or has_sel_kw:
         return _get_selection(question, ctx_data)
 
-    # Режим 1: Поиск субсидий
     return _search_measures(question, ctx_data)
 
 
 # ---------------------------------------------------------------------------
-# Tool registration
+# Registration
 # ---------------------------------------------------------------------------
 
 def get_tools() -> List[ToolEntry]:
@@ -395,12 +395,12 @@ def get_tools() -> List[ToolEntry]:
         ToolEntry("query_govsupport", {
             "name": "query_govsupport",
             "description": (
-                "Запрос к БД мер господдержки РФ (субсидии, отборы, документы). "
-                "Режим 1 — поиск: question='субсидии МСП на сертификацию', "
+                "Запрос к БД мер господдержки РФ (субсидии, отборы, перечни документов). "
+                "Режим 1 (поиск мер): question='субсидии МСП сертификация', "
                 "context={region: 'Ленинградская', applicant_type: 'ИП'}. "
-                "Режим 2 — детали отбора: context={competition_code: 'UUID'} или UUID/ID в question. "
-                "Режим 3 — raw: sql='SELECT ...'. "
-                "Только SELECT. БД read-only."
+                "Режим 2 (детали отбора): context={competition_code: 'UUID или ID'} "
+                "или UUID/числовой ID в поле question. "
+                "Режим 3 (raw SQL): sql='SELECT ...' — только SELECT, БД read-only."
             ),
             "parameters": {
                 "type": "object",
@@ -411,7 +411,7 @@ def get_tools() -> List[ToolEntry]:
                     },
                     "context": {
                         "type": "object",
-                        "description": "Фильтры: competition_code (UUID/ID отбора), region, applicant_type (ИП/ЮЛ/МСП)",
+                        "description": "Фильтры: competition_code (UUID/ID), region, applicant_type (ИП/ЮЛ/МСП)",
                     },
                     "sql": {
                         "type": "string",
