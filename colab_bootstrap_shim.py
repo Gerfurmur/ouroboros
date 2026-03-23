@@ -74,7 +74,7 @@ _rc = subprocess.run(
 ).returncode
 
 if _rc == 0:
-    subprocess.run(["git", "checkout", BOOT_BRANCH], cwd=str(REPO_DIR), check=True)
+    subprocess.run(["git", "checkout", BOOT_BRANCH, "--"], cwd=str(REPO_DIR), check=True)
     subprocess.run(["git", "reset", "--hard", f"origin/{BOOT_BRANCH}"], cwd=str(REPO_DIR), check=True)
 else:
     print(f"[boot] branch {BOOT_BRANCH} not found on fork — creating from origin/main")
