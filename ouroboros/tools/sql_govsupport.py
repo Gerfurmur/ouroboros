@@ -77,16 +77,30 @@ def _get_conn():
     except ImportError:
         raise RuntimeError("psycopg2 не установлен.")
 
-    missing = [k for k in ("DB_HOST", "DB_NAME", "DB_USER", "DB_PASS") if not os.environ.get(k)]
+    # Принимаем оба варианта имён переменных для совместимости
+    host = os.environ.get("DB_HOST", "")
+    dbname = os.environ.get("DB_NAME", "")
+    user = os.environ.get("DB_USER") or os.environ.get("DB_USERNAME", "")
+    password = os.environ.get("DB_PASSWORD") or os.environ.get("DB_PASS", "")
+
+    missing = [
+        label for label, val in [
+            ("DB_HOST", host),
+            ("DB_NAME", dbname),
+            ("DB_USER/DB_USERNAME", user),
+            ("DB_PASSWORD/DB_PASS", password),
+        ]
+        if not val
+    ]
     if missing:
         raise RuntimeError(f"Не заданы секреты: {', '.join(missing)}")
 
     return psycopg2.connect(
-        host=os.environ["DB_HOST"],
+        host=host,
         port=int(os.environ.get("DB_PORT", "5432")),
-        dbname=os.environ["DB_NAME"],
-        user=os.environ["DB_USER"],
-        password=os.environ["DB_PASS"],
+        dbname=dbname,
+        user=user,
+        password=password,
         connect_timeout=10,
         options="-c default_transaction_read_only=on",
     )
@@ -194,6 +208,7 @@ SELECT
     sel.begin_competition_date,
     sel.end_competition_date,
     sel.max_amount_for_person,
+    sel.max_amount_for_year,
     sel.link_selection,
     sp.individual_entrepreneur,
     sp.legal_entity,
@@ -204,7 +219,7 @@ LEFT JOIN subsidies_promote sp ON sp.subsidy_id = sel.subsidy_id
 LEFT JOIN regions r ON r.id = sp.region_code
 WHERE ({kw_where})
 {extra_where}
-ORDER BY sel.load_dttm DESC
+ORDER BY sel.status_closed ASC, sel.load_dttm DESC
 LIMIT 20
 """.strip()
 
@@ -225,7 +240,7 @@ LIMIT 20
             "applicant_types": "/".join(types) if types else "не указано",
             "region": r.get("region_name", ""),
             "end_date": str(r.get("end_competition_date", "")),
-            "max_amount": str(r.get("max_amount_for_person", "")),
+            "max_amount": str(r.get("max_amount_for_year") or r.get("max_amount_for_person", "")),
             "link": r.get("link_selection", ""),
             "why_matched": "; ".join(explanations) if explanations else "общий поиск",
         })
@@ -255,7 +270,8 @@ def _get_selection(question: str, ctx_data: Dict) -> Dict:
     int_ids = _INT_RE.findall(question) if not uuids else []
 
     if uuids:
-        conditions.append("(sel.id::text = %s OR sel.competition_id::text = %s)")
+        # Используем приведение типов PostgreSQL для UUID
+        conditions.append("(sel.id = %s::uuid OR sel.competition_id = %s::uuid)")
         params += [uuids[0], uuids[0]]
     elif int_ids:
         conditions.append("sel.selection_id = %s")
@@ -272,6 +288,8 @@ def _get_selection(question: str, ctx_data: Dict) -> Dict:
     sql_sel = f"""
 SELECT
     sel.selection_id,
+    sel.id AS uuid_id,
+    sel.competition_id,
     sel.title,
     sel.short_name,
     sel.status_closed,
